@@ -6,23 +6,21 @@ import qualified Data.ByteString.Lazy.Char8 as L8
 import           Network.HTTP.Simple
 import Control.Monad
 import Control.Concurrent
-import Control.Concurrent.BoundedChan
+import qualified Control.Concurrent.BoundedChan as BChan
 import Control.Concurrent.Chan
 
-data HttpTask = HttpTask {
-  uri :: String,
-  startTime:: Int } | HttpStop deriving (Show)
+data Message = DownloaderRequest {
+  uri :: String
+} | DownloaderResponse {
+  uri :: String
+} | Stop deriving (Show)
 
-newtype HttpQueue = HttpQueue (MVar HttpTask)
+type HttpQueue = Chan Message
+type BoundedHttpQueue = BChan.BoundedChan Message
 
-newHttpQueue :: IO HttpQueue
-newHttpQueue = do
-  m <- newEmptyMVar
-  let h = HttpQueue m
-  return h
 
 {- scheme:
-uri -> executor -> [[ doanloaders ]] -> [[parsers]] ->
+uri -> executor -> [[ downloaders ]] -> [[parsers]] ->
          ^                                           |
          |                                           V
          ^-------------------------------------------<
@@ -31,24 +29,48 @@ executor -> Control.Concurrent.BoundedChan -> [[ downloaders ]]
 [[parsers]] -> Control.Concurrent.Chan -> executor
 -}
 
-{-
- TODO: rename -> executor
- -}
-download :: HttpQueue -> IO ()
-download (HttpQueue x) = loop
+executor :: HttpQueue -> BoundedHttpQueue -> MVar Message -> IO ()
+executor input output ctl = loop
   where
     loop = do
-      cmd <- takeMVar x
+      cmd <- readChan input
       case cmd of
-        HttpTask { uri = u, startTime = _ } -> do
-          putStrLn u
+        DownloaderRequest { uri = _ } -> do
+          BChan.writeChan output cmd
           loop
-        HttpStop -> return ()
+        Stop -> do
+          putMVar ctl cmd
+          return ()
+
+downloader :: BoundedHttpQueue -> IO()
+downloader input = loop
+  where
+    loop = do
+      cmd <- BChan.readChan input
+      case cmd of
+        DownloaderRequest { uri = u } -> do
+          request <- parseRequest u
+          response <- httpLBS request
+          putStrLn $ "The status code of " ++  u ++ " was " ++ show (getResponseStatusCode response)
+          loop
+        Stop -> return ()
 
 main :: IO ()
 main = do
     let reqs = ["http://httpbin.org/get", "http://httpbin.org/get", "http://google.com"]
-    queue <- newHttpQueue
+    let ndownloaders = 1000
+    executorInput <- newChan
+    executorOutput <- BChan.newBoundedChan ndownloaders
+    ctl <- newEmptyMVar
+    forM_ [1 .. ndownloaders] (\_ -> forkIO $ downloader executorOutput)
+    forkIO $ executor executorInput executorOutput ctl
+    {-takeMVar ctl-}
+    forM_ reqs (\r -> writeChan executorInput $ DownloaderRequest r)
+    threadDelay 100000000
+    writeChan executorInput Stop
+    {-executor executorInput executorOutput ctl-}
+    {-forkIO $ executor executorInput executorOutput ctl-}
+    takeMVar ctl
     return ()
 
     {-
