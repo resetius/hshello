@@ -10,6 +10,8 @@ import qualified Control.Concurrent.BoundedChan as BChan
 import Control.Concurrent.Chan
 import Text.HTML.TagSoup
 import Text.StringLike
+import Data.Maybe
+import Network.HTTP.Client
 
 data Message = DownloaderRequest {
   uri :: String
@@ -32,11 +34,7 @@ executor -> Control.Concurrent.BoundedChan -> [[ downloaders ]]
 -}
 
 tagFilter :: (StringLike a) => Tag a -> Bool
-tagFilter (TagOpen "a" attrs) =
-  let r = lookup "href" attrs in
-    case r of
-      Nothing -> False
-      _ -> True
+tagFilter (TagOpen "a" attrs) = isJust $ lookup "href" attrs
 tagFilter tag = False
 
 tagHref :: (StringLike a) => Tag a -> String
@@ -52,9 +50,19 @@ extractLinks response =
   let tags = parseTags $ getResponseBody response in
     map tagHref $ filter tagFilter tags
 
-enrichLink :: String -> String -> String
+protoPrefix :: Request -> String
+protoPrefix r =
+  if secure r then
+    "https://"
+  else
+    "http://"
+
+enrichLink :: Request -> String -> String
 enrichLink _ link@('h':'t':'t':'p':_) = link
-enrichLink url link = url ++ link
+enrichLink r link@('/':_) =
+  protoPrefix r ++ toString (host r) ++ ":" ++ show (port r) ++ link
+enrichLink r link =
+  protoPrefix r ++ toString (host r) ++ ":" ++ show (port r) ++ toString (path r) ++ link
 
 executor :: HttpQueue -> BoundedHttpQueue -> MVar Message -> IO ()
 executor input output ctl = loop
@@ -76,31 +84,42 @@ downloader input output = loop
       cmd <- BChan.readChan input
       case cmd of
         DownloaderRequest { uri = u } -> do
+          {- TODO: check u already downloaded here -}
+          {- TODO: filter links here (local links/external links/blacklisted and so on)-}
           putStrLn $ "Downloading " ++ u
           request <- parseRequest u
           response <- httpLBS request
           putStrLn $ "The status code of " ++  u ++ " was " ++ show (getResponseStatusCode response)
           {-let tags = parseTags $ getResponseBody response
           forM_ tags print-}
-          let links = map (enrichLink u) $ extractLinks response
+          let links = map (enrichLink request) $ extractLinks response
           {-forM_ links print-}
           forM_ links $ writeChan output . DownloaderRequest
           loop
         Stop -> return ()
 
+waitLoop :: HttpQueue -> BoundedHttpQueue -> IO()
+waitLoop input output = do
+  empty1 <- isEmptyChan input
+  empty2 <- BChan.isEmptyChan output
+  if empty1 && empty2 then
+    return ()
+  else
+    waitLoop input output
+
 main :: IO ()
 main = do
-    let reqs = ["http://httpbin.org"]
+    let reqs = ["http://localhost:8083"]
     let ndownloaders = 1000
     executorInput <- newChan
-    executorOutput <- BChan.newBoundedChan ndownloaders
+    executorOutput <- BChan.newBoundedChan (10*ndownloaders)
     ctl <- newEmptyMVar
     forM_ [1 .. ndownloaders] (\_ -> forkIO $ downloader executorOutput executorInput)
     forkIO $ executor executorInput executorOutput ctl
     {-takeMVar ctl-}
     forM_ reqs $ writeChan executorInput . DownloaderRequest
-    threadDelay 100000000
-    writeChan executorInput Stop
+    {-threadDelay 1000-}
+    waitLoop executorInput executorOutput
     {-executor executorInput executorOutput ctl-}
     {-forkIO $ executor executorInput executorOutput ctl-}
     takeMVar ctl
